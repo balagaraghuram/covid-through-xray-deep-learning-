@@ -1,0 +1,128 @@
+ import os
+import cv2
+import numpy as np
+import argparse
+import matplotlib.pyplot as plt
+from imutils import paths
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelBinarizer
+from sklearn.metrics import classification_report, confusion_matrix
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.applications import VGG16
+from tensorflow.keras.layers import AveragePooling2D, Dropout, Flatten, Dense, Input
+from tensorflow.keras.models import Model
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.utils import to_categorical
+
+# Construct argument parser for command line input
+ap = argparse.ArgumentParser()
+ap.add_argument("-d", "--dataset", required=True, help="Path to input dataset")
+ap.add_argument("-p", "--plot", type=str, default="plot.png", help="Path to output loss/accuracy plot")
+ap.add_argument("-m", "--model", type=str, default="covid19.model", help="Path to output trained model")
+args = vars(ap.parse_args())
+
+# Initialize hyperparameters
+INIT_LR = 1e-3
+EPOCHS = 25
+BS = 8
+
+# Load image paths from dataset directory
+print("[INFO] Loading images...")
+imagePaths = list(paths.list_images(args["dataset"]))
+data = []
+labels = []
+
+# Loop over image paths
+for imagePath in imagePaths:
+    # Extract class label from file path
+    label = imagePath.split(os.path.sep)[-2]
+    # Load image, convert to RGB, resize to 224x224 pixels
+    image = cv2.imread(imagePath)
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    image = cv2.resize(image, (224, 224))
+    # Append image and label to data and labels lists
+    data.append(image)
+    labels.append(label)
+
+# Convert data and labels to NumPy arrays and scale pixel intensities to [0, 1]
+data = np.array(data) / 255.0
+labels = np.array(labels)
+
+# Perform one-hot encoding on labels
+lb = LabelBinarizer()
+labels = lb.fit_transform(labels)
+labels = to_categorical(labels)
+
+# Split data into training and testing sets
+(trainX, testX, trainY, testY) = train_test_split(data, labels, test_size=0.20, stratify=labels, random_state=42)
+
+# Initialize training data augmentation object
+trainAug = ImageDataGenerator(rotation_range=15, fill_mode="nearest")
+
+# Load VGG16 base model without fully connected layers
+baseModel = VGG16(weights="imagenet", include_top=False, input_tensor=Input(shape=(224, 224, 3)))
+
+# Construct custom classifier to be placed on top of base model
+headModel = baseModel.output
+headModel = AveragePooling2D(pool_size=(4, 4))(headModel)
+headModel = Flatten(name="flatten")(headModel)
+headModel = Dense(64, activation="relu")(headModel)
+headModel = Dropout(0.5)(headModel)
+headModel = Dense(2, activation="softmax")(headModel)
+
+# Combine base model and custom head to create final model
+model = Model(inputs=baseModel.input, outputs=headModel)
+
+# Freeze base model layers
+for layer in baseModel.layers:
+    layer.trainable = False
+
+# Compile the model
+print("[INFO] Compiling model...")
+opt = Adam(lr=INIT_LR, decay=INIT_LR / EPOCHS)
+model.compile(loss="binary_crossentropy", optimizer=opt, metrics=["accuracy"])
+
+# Train the model
+print("[INFO] Training head...")
+H = model.fit_generator(trainAug.flow(trainX, trainY, batch_size=BS),
+                        steps_per_epoch=len(trainX) // BS,
+                        validation_data=(testX, testY),
+                        validation_steps=len(testX) // BS,
+                        epochs=EPOCHS)
+
+# Evaluate the model
+print("[INFO] Evaluating network...")
+predIdxs = model.predict(testX, batch_size=BS)
+predIdxs = np.argmax(predIdxs, axis=1)
+print(classification_report(testY.argmax(axis=1), predIdxs, target_names=lb.classes_))
+
+# Compute confusion matrix and derive accuracy, sensitivity, and specificity
+cm = confusion_matrix(testY.argmax(axis=1), predIdxs)
+total = sum(sum(cm))
+acc = (cm[0, 0] + cm[1, 1]) / total
+sensitivity = cm[0, 0] / (cm[0, 0] + cm[0, 1])
+specificity = cm[1, 1] / (cm[1, 0] + cm[1, 1])
+
+# Display evaluation metrics
+print(cm)
+print("Accuracy: {:.4f}".format(acc))
+print("Sensitivity: {:.4f}".format(sensitivity))
+print("Specificity: {:.4f}".format(specificity))
+
+# Plot training loss and accuracy
+N = EPOCHS
+plt.style.use("ggplot")
+plt.figure()
+plt.plot(np.arange(0, N), H.history["loss"], label="Training Loss")
+plt.plot(np.arange(0, N), H.history["val_loss"], label="Validation Loss")
+plt.plot(np.arange(0, N), H.history["accuracy"], label="Training Accuracy")
+plt.plot(np.arange(0, N), H.history["val_accuracy"], label="Validation Accuracy")
+plt.title("Training Loss and Accuracy on COVID-19 Dataset")
+plt.xlabel("Epoch")
+plt.ylabel("Loss/Accuracy")
+plt.legend(loc="lower left")
+plt.savefig(args["plot"])
+
+# Save the trained model
+model.save(args["model"])
+print("[INFO] Model saved successfully.")
